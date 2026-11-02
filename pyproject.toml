@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=78.1.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "donatello"
+version = "0.1.0"
+description = "A local-first AI coding assistant"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+donatello = "donatello.cli:main"
+
+[tool.setuptools]
+packages = ["donatello"]
