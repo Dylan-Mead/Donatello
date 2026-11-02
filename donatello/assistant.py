@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -75,52 +76,65 @@ class CodingAgent:
         self.provider = provider
         self.test_timeout = test_timeout
 
-    def execute_plan(self, plan: dict[str, Any], repository: Path) -> list[dict[str, Any]]:
+    def execute_plan(
+        self, plan: dict[str, Any], repository: Path, request_log: Any = None
+    ) -> list[dict[str, Any]]:
         root = repository.resolve(strict=True)
         if not root.is_dir():
             raise AssistantError(f"Repository is not a directory: {root}")
         results = []
         for task in plan["tasks"]:
-            context = _repository_context(root)
-            response = self.provider.complete(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a coding agent. Implement the assigned task in the provided repository. "
-                            "Return only JSON with this shape: "
-                            '{"summary":"...","files":[{"path":"relative/path","content":"complete UTF-8 file content"}],'
-                            '"tests":[["python","-m","unittest"]]}. '
-                            "Use repository-relative paths. Include only tests that should be run; "
-                            "tests must use Python unittest or pytest. Do not return shell commands."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Task: {task['title']}\n{task['description']}\n\n"
-                            f"Repository files:\n{context}"
-                        ),
-                    },
-                ],
-                json_response=True,
-            )
-            changes = _parse_changes(response.text)
-            tests = _validate_tests(changes.get("tests", []))
-            written = _apply_files(root, changes["files"])
-            test_results = [
-                self._run_test(root, command)
-                for command in tests
-            ]
-            results.append(
-                {
-                    "task": task["title"],
-                    "summary": changes.get("summary", ""),
-                    "files": written,
-                    "tests": test_results,
-                }
-            )
+            started = time.monotonic()
+            written: list[str] = []
+            try:
+                result = self._execute_task(task, root, written)
+            except Exception as error:
+                if request_log:
+                    request_log.task(task["title"], time.monotonic() - started, written, str(error))
+                raise
+            if request_log:
+                request_log.task(task["title"], time.monotonic() - started, written)
+            results.append(result)
         return results
+
+    def _execute_task(self, task: dict[str, Any], root: Path, written_out: list[str]) -> dict[str, Any]:
+        context = _repository_context(root)
+        response = self.provider.complete(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a coding agent. Implement the assigned task in the provided repository. "
+                        "Return only JSON with this shape: "
+                        '{"summary":"...","files":[{"path":"relative/path","content":"complete UTF-8 file content"}],'
+                        '"tests":[["python","-m","unittest"]]}. '
+                        "Use repository-relative paths. Include only tests that should be run; "
+                        "tests must use Python unittest or pytest. Do not return shell commands."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task: {task['title']}\n{task['description']}\n\n"
+                        f"Repository files:\n{context}"
+                    ),
+                },
+            ],
+            json_response=True,
+        )
+        changes = _parse_changes(response.text)
+        tests = _validate_tests(changes.get("tests", []))
+        written_out.extend(_apply_files(root, changes["files"]))
+        test_results = [
+            self._run_test(root, command)
+            for command in tests
+        ]
+        return {
+            "task": task["title"],
+            "summary": changes.get("summary", ""),
+            "files": list(written_out),
+            "tests": test_results,
+        }
 
     def _run_test(self, root: Path, command: list[str]) -> dict[str, Any]:
         try:
@@ -209,6 +223,10 @@ def _apply_files(root: Path, files: list[dict[str, str]]) -> list[str]:
     return written
 
 
+_PYTHON_COMMAND_NAMES = {"python", "python3", sys.executable}
+_SAFE_TEST_FLAGS = {"discover", "-v", "-q", "--verbose", "--quiet"}
+
+
 def _validate_tests(tests: Any) -> list[list[str]]:
     if not isinstance(tests, list):
         raise AssistantError("Tests must be an array of argument arrays")
@@ -216,16 +234,43 @@ def _validate_tests(tests: Any) -> list[list[str]]:
     for command in tests:
         if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
             raise AssistantError("Each test command must be an array of strings")
-        if command in (["python", "-m", "unittest"], ["python3", "-m", "unittest"]):
-            validated.append([sys.executable, "-m", "unittest", "discover"])
-            continue
-        if command in (["python", "-m", "pytest"], ["python3", "-m", "pytest"], ["pytest"]):
-            validated.append([sys.executable, "-m", "pytest"])
-            continue
-        raise AssistantError(
-            "Only the standard Python unittest and pytest test commands are supported"
-        )
+        normalized = _normalize_test_command(command)
+        if normalized is None:
+            raise AssistantError(
+                "Only the standard Python unittest and pytest test commands are supported"
+            )
+        validated.append(normalized)
     return validated
+
+
+def _normalize_test_command(command: list[str]) -> list[str] | None:
+    """Rewrite a trusted unittest/pytest invocation to use sys.executable.
+
+    Accepts the bare runner commands plus an optional trailing target (a test
+    file, dotted module name, or a small allowlist of safe flags), so models
+    that name the specific test they wrote are not rejected outright. Any
+    other form (e.g. ``python -c ...``) is rejected.
+    """
+    if command and command[0] == "pytest":
+        prefix, arguments = [sys.executable, "-m", "pytest"], command[1:]
+    elif len(command) >= 3 and command[0] in _PYTHON_COMMAND_NAMES and command[1] == "-m" and command[2] in ("unittest", "pytest"):
+        prefix, arguments = [sys.executable, "-m", command[2]], command[3:]
+    else:
+        return None
+    if not arguments:
+        return prefix + ["discover"] if prefix[-1] == "unittest" else prefix
+    if not all(_is_safe_test_argument(argument) for argument in arguments):
+        return None
+    return prefix + arguments
+
+
+def _is_safe_test_argument(argument: str) -> bool:
+    if argument in _SAFE_TEST_FLAGS:
+        return True
+    if argument.startswith("-"):
+        return False
+    path = Path(argument)
+    return not path.is_absolute() and not any(part in {"", ".", ".."} for part in path.parts)
 
 
 def _repository_context(root: Path) -> str:

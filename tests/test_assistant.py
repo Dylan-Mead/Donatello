@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,6 +75,26 @@ class CodingAgentTests(unittest.TestCase):
     def test_rejects_untrusted_test_commands(self):
         with self.assertRaises(AssistantError):
             _validate_tests([["python", "-c", "print('not a test')"]])
+
+    def test_accepts_targeted_unittest_command(self):
+        self.assertEqual(
+            _validate_tests([["python", "-m", "unittest", "tests/test_app.py"]]),
+            [[sys.executable, "-m", "unittest", "tests/test_app.py"]],
+        )
+
+    def test_accepts_targeted_pytest_command(self):
+        self.assertEqual(
+            _validate_tests([["pytest", "tests/test_app.py", "-v"]]),
+            [[sys.executable, "-m", "pytest", "tests/test_app.py", "-v"]],
+        )
+
+    def test_rejects_test_target_outside_repository(self):
+        with self.assertRaises(AssistantError):
+            _validate_tests([["pytest", "../outside/test_app.py"]])
+
+    def test_rejects_unsafe_test_flag(self):
+        with self.assertRaises(AssistantError):
+            _validate_tests([["pytest", "--rootdir=/etc"]])
 
     def test_validates_test_commands_before_writing_files(self):
         response = json.dumps(

@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from .assistant import AssistantError, CodingAgent, ProjectManager, benchmark
+from .requestlog import RequestLog
 from .providers import FallbackProvider, OllamaProvider, OpenAICompatibleProvider, ProviderError
 
 
@@ -60,11 +62,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             provider = _provider(args.model, args)
-            plan = ProjectManager(provider).plan(args.request)
+            request_log = RequestLog()
+            started = time.monotonic()
+            try:
+                plan = ProjectManager(provider).plan(args.request)
+            except Exception as error:
+                request_log.plan(None, time.monotonic() - started, str(error))
+                raise
+            request_log.plan(plan, time.monotonic() - started)
             if args.command == "plan":
                 output = plan
             else:
-                results = CodingAgent(provider).execute_plan(plan, args.repo)
+                results = CodingAgent(provider).execute_plan(plan, args.repo, request_log)
                 output = {"plan": plan, "results": results}
         print(json.dumps(output, indent=2))
         if args.command == "run" and any(
