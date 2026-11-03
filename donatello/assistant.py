@@ -26,6 +26,23 @@ MAX_CONTEXT_FILES = 80
 MAX_FILE_BYTES = 30_000
 MAX_CONTEXT_BYTES = 500_000
 MAX_TEST_TIMEOUT = 300
+DEFAULT_PLANNER_PROMPT = (
+    "You are a project manager for a software coding assistant. "
+    "Break the user's request into a small, ordered set of actionable coding tasks. "
+    'Return only JSON: {"tasks":[{"title":"...","description":"..."}]}. '
+    "Do not include markdown or extra fields. "
+    "If the user requests changes, return a complete revised plan in the same JSON format."
+)
+DEFAULT_CODER_PROMPT = (
+    "You are a coding agent. Implement the assigned task in the provided repository. "
+    "Return only JSON with this shape: "
+    '{"summary":"...","files":[{"path":"relative/path","reason":"why this file is created or changed",'
+    '"content":"complete UTF-8 file content"}],'
+    '"tests":[["python","-m","unittest"]]}. '
+    "Use repository-relative paths. Include only tests that should be run; "
+    "tests must use Python unittest or pytest. Do not return shell commands. "
+    "If the user requests changes, return a complete revised response in the same JSON format."
+)
 
 
 class AssistantError(RuntimeError):
@@ -33,27 +50,36 @@ class AssistantError(RuntimeError):
 
 
 class ProjectManager:
-    def __init__(self, provider: Any) -> None:
+    def __init__(self, provider: Any, system_prompt: str = DEFAULT_PLANNER_PROMPT) -> None:
         self.provider = provider
+        self.system_prompt = system_prompt
 
-    def plan(self, request: str) -> dict[str, Any]:
-        response = self.provider.complete(
-            [
+    def plan(self, request: str, approver: Any = None) -> dict[str, Any]:
+        """Plan a request; with an approver, revise the plan until the user approves it."""
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": request},
+        ]
+        while True:
+            response = self.provider.complete(messages, json_response=True)
+            plan = self._parse_plan(response.text)
+            feedback = approver.review("Proposed plan", _format_plan(plan)) if approver else None
+            if feedback is None:
+                return plan
+            messages += [
+                {"role": "assistant", "content": response.text},
                 {
-                    "role": "system",
+                    "role": "user",
                     "content": (
-                        "You are a project manager for a software coding assistant. "
-                        "Break the user's request into a small, ordered set of actionable coding tasks. "
-                        'Return only JSON: {"tasks":[{"title":"...","description":"..."}]}. '
-                        "Do not include markdown or extra fields."
+                        "The user did not approve this plan and suggested these changes:\n"
+                        f"{feedback}\n\nReturn a complete revised plan in the same JSON format."
                     ),
                 },
-                {"role": "user", "content": request},
-            ],
-            json_response=True,
-        )
+            ]
+
+    def _parse_plan(self, text: str) -> dict[str, Any]:
         try:
-            result = json.loads(response.text)
+            result = json.loads(text)
         except json.JSONDecodeError as error:
             raise AssistantError(f"Project manager returned invalid JSON: {error}") from error
         tasks = result.get("tasks") if isinstance(result, dict) else None
@@ -72,9 +98,17 @@ class ProjectManager:
 
 
 class CodingAgent:
-    def __init__(self, provider: Any, test_timeout: int = MAX_TEST_TIMEOUT) -> None:
+    def __init__(
+        self,
+        provider: Any,
+        test_timeout: int = MAX_TEST_TIMEOUT,
+        system_prompt: str = DEFAULT_CODER_PROMPT,
+        approver: Any = None,
+    ) -> None:
         self.provider = provider
+        self.system_prompt = system_prompt
         self.test_timeout = test_timeout
+        self.approver = approver
 
     def execute_plan(
         self, plan: dict[str, Any], repository: Path, request_log: Any = None
@@ -90,41 +124,53 @@ class CodingAgent:
                 result = self._execute_task(task, root, written)
             except Exception as error:
                 if request_log:
-                    request_log.task(task["title"], time.monotonic() - started, written, str(error))
+                    request_log.task(
+                        task["title"], time.monotonic() - started, _absolute(root, written), str(error)
+                    )
                 raise
             if request_log:
-                request_log.task(task["title"], time.monotonic() - started, written)
+                request_log.task(task["title"], time.monotonic() - started, _absolute(root, written))
             results.append(result)
         return results
 
     def _execute_task(self, task: dict[str, Any], root: Path, written_out: list[str]) -> dict[str, Any]:
         context = _repository_context(root)
-        response = self.provider.complete(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a coding agent. Implement the assigned task in the provided repository. "
-                        "Return only JSON with this shape: "
-                        '{"summary":"...","files":[{"path":"relative/path","content":"complete UTF-8 file content"}],'
-                        '"tests":[["python","-m","unittest"]]}. '
-                        "Use repository-relative paths. Include only tests that should be run; "
-                        "tests must use Python unittest or pytest. Do not return shell commands."
-                    ),
-                },
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task['title']}\n{task['description']}\n\n"
+                    f"Repository files:\n{context}"
+                ),
+            },
+        ]
+        while True:
+            response = self.provider.complete(messages, json_response=True)
+            changes = _parse_changes(response.text)
+            tests = _validate_tests(changes.get("tests", []))
+            targets = _resolve_targets(root, changes["files"])
+            feedback = (
+                self.approver.review(
+                    f"Proposed action: {task['title']}",
+                    _format_proposal(task, changes, targets, tests, root),
+                )
+                if self.approver
+                else None
+            )
+            if feedback is None:
+                break
+            messages += [
+                {"role": "assistant", "content": response.text},
                 {
                     "role": "user",
                     "content": (
-                        f"Task: {task['title']}\n{task['description']}\n\n"
-                        f"Repository files:\n{context}"
+                        "The user did not approve these changes and suggested:\n"
+                        f"{feedback}\n\nReturn a complete revised response in the same JSON format."
                     ),
                 },
-            ],
-            json_response=True,
-        )
-        changes = _parse_changes(response.text)
-        tests = _validate_tests(changes.get("tests", []))
-        written_out.extend(_apply_files(root, changes["files"]))
+            ]
+        written_out.extend(_write_targets(targets))
         test_results = [
             self._run_test(root, command)
             for command in tests
@@ -153,6 +199,10 @@ class CodingAgent:
             "passed": result.returncode == 0,
             "output": (result.stdout + result.stderr)[-10_000:],
         }
+
+
+def _absolute(root: Path, relative_paths: list[str]) -> list[str]:
+    return [str(root / path) for path in relative_paths]
 
 
 def benchmark(provider_factory: Any, models: list[str], prompt: str) -> list[dict[str, Any]]:
@@ -199,10 +249,46 @@ def _parse_changes(text: str) -> dict[str, Any]:
             item.get("content"), str
         ):
             raise AssistantError("Each file change must have a path and string content")
+        if "reason" in item and not isinstance(item["reason"], str):
+            raise AssistantError("A file change reason must be a string")
     return changes
 
 
-def _apply_files(root: Path, files: list[dict[str, str]]) -> list[str]:
+def _format_plan(plan: dict[str, Any]) -> str:
+    return "\n".join(
+        f"{number}. {task['title']}\n   {task['description']}"
+        for number, task in enumerate(plan["tasks"], 1)
+    )
+
+
+def _format_proposal(
+    task: dict[str, Any],
+    changes: dict[str, Any],
+    targets: list[tuple[Path, Path, str]],
+    tests: list[list[str]],
+    root: Path,
+) -> str:
+    lines = [f"Task: {task['title']}", f"Why: {task['description']}"]
+    if changes.get("summary"):
+        lines.append(f"Summary: {changes['summary']}")
+    lines.append(f"Repository: {root}")
+    for item, (_, target, content) in zip(changes["files"], targets):
+        verb = "OVERWRITE existing file" if target.exists() else "CREATE new file"
+        lines += [
+            "",
+            f"{verb}: {target}",
+            f"Why: {item.get('reason') or changes.get('summary') or task['description']}",
+            "----- code -----",
+            content.rstrip("\n"),
+            "----- end code -----",
+        ]
+    if tests:
+        lines += ["", f"RUN tests (working directory {root}):"]
+        lines += [f"  {' '.join(command)}" for command in tests]
+    return "\n".join(lines)
+
+
+def _resolve_targets(root: Path, files: list[dict[str, str]]) -> list[tuple[Path, Path, str]]:
     targets = []
     for item in files:
         relative = Path(item["path"])
@@ -214,13 +300,20 @@ def _apply_files(root: Path, files: list[dict[str, str]]) -> list[str]:
         if target.exists() and not target.is_file():
             raise AssistantError(f"Not a regular file: {item['path']}")
         targets.append((relative, target, item["content"]))
+    return targets
 
+
+def _write_targets(targets: list[tuple[Path, Path, str]]) -> list[str]:
     written = []
     for relative, target, content in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         written.append(relative.as_posix())
     return written
+
+
+def _apply_files(root: Path, files: list[dict[str, str]]) -> list[str]:
+    return _write_targets(_resolve_targets(root, files))
 
 
 _PYTHON_COMMAND_NAMES = {"python", "python3", sys.executable}

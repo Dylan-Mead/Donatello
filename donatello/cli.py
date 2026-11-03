@@ -10,9 +10,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .approval import ApprovalCancelled, Approver
 from .assistant import AssistantError, CodingAgent, ProjectManager, benchmark
+from .config import load_config
 from .requestlog import RequestLog
 from .providers import FallbackProvider, OllamaProvider, OpenAICompatibleProvider, ProviderError
+
+
+def _default_repo() -> Path:
+    """Return the nearest enclosing git repository root, or the current directory."""
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return current
 
 
 def _provider(model: str, args: argparse.Namespace) -> Any:
@@ -29,19 +40,34 @@ def _provider(model: str, args: argparse.Namespace) -> Any:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="donatello", description="Local-first AI coding assistant")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--repo",
+        type=Path,
+        help="Path to the repository to work on (default: the repository containing the current directory)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for name in ("plan", "run"):
-        command = subparsers.add_parser(name)
+        command = subparsers.add_parser(name, parents=[common])
         command.add_argument("request", help="Coding request")
-        command.add_argument("--model", default="qwen2.5-coder:7b")
+        command.add_argument("--config", help="Config file name in the configs folder (default: default)")
+        command.add_argument("--model", help="Override the config's planner and coder models")
         command.add_argument("--ollama-url")
         command.add_argument("--external-base-url")
         command.add_argument("--external-model")
         if name == "run":
-            command.add_argument("--repo", required=True, type=Path)
+            command.add_argument(
+                "--auto",
+                action="store_true",
+                help="Do not ask for approval before planning and file/test actions",
+            )
 
-    compare = subparsers.add_parser("benchmark", help="Compare response time and JSON quality across Ollama models")
+    compare = subparsers.add_parser(
+        "benchmark",
+        parents=[common],
+        help="Compare response time and JSON quality across Ollama models",
+    )
     compare.add_argument("--models", nargs="+", required=True)
     compare.add_argument(
         "--prompt",
@@ -54,6 +80,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        args.repo = args.repo.expanduser() if args.repo else _default_repo()
+        if not args.repo.is_dir():
+            raise ValueError(f"Repository is not a directory: {args.repo}")
         if args.command == "benchmark":
             output = benchmark(
                 lambda model: OllamaProvider(model=model, base_url=args.ollama_url),
@@ -61,19 +90,35 @@ def main(argv: list[str] | None = None) -> int:
                 args.prompt,
             )
         else:
-            provider = _provider(args.model, args)
+            config = load_config(args.config)
+            planner_provider = _provider(args.model or config.planner_model, args)
+            coder_provider = _provider(args.model or config.coder_model, args)
             request_log = RequestLog()
+            request_details = {
+                "request": args.request,
+                "arguments": {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(args).items()
+                    if key != "request"
+                },
+            }
+            approver = Approver(auto=args.auto) if args.command == "run" else None
             started = time.monotonic()
             try:
-                plan = ProjectManager(provider).plan(args.request)
+                plan = ProjectManager(planner_provider, config.planner_system_prompt).plan(
+                    args.request, approver
+                )
             except Exception as error:
-                request_log.plan(None, time.monotonic() - started, str(error))
+                request_log.plan(None, time.monotonic() - started, str(error), request_details)
                 raise
-            request_log.plan(plan, time.monotonic() - started)
+            request_log.plan(plan, time.monotonic() - started, request=request_details)
             if args.command == "plan":
                 output = plan
             else:
-                results = CodingAgent(provider).execute_plan(plan, args.repo, request_log)
+                agent = CodingAgent(
+                    coder_provider, system_prompt=config.coder_system_prompt, approver=approver
+                )
+                results = agent.execute_plan(plan, args.repo, request_log)
                 output = {"plan": plan, "results": results}
         print(json.dumps(output, indent=2))
         if args.command == "run" and any(
@@ -83,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "benchmark" and any("error" in result for result in output):
             return 1
         return 0
-    except (AssistantError, OSError, ProviderError, ValueError) as error:
+    except (ApprovalCancelled, AssistantError, OSError, ProviderError, ValueError) as error:
         print(f"donatello: {error}", file=sys.stderr)
         return 1
 
