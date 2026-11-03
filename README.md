@@ -3,7 +3,8 @@
 Donatello is a local-first Python coding assistant. It processes each coding
 request in two phases: a project manager turns the request into ordered JSON
 tasks, then a coding agent implements each task in a selected repository and
-runs supported tests.
+runs supported tests. Before it changes anything, it shows you what it wants to
+do and waits for your approval (see [Approval](#approval)).
 
 ## Requirements
 
@@ -24,32 +25,33 @@ From this directory, install the command:
 python -m pip install -e .
 ```
 
-Every command (`plan`, `run` and `benchmark`) works on a repository. By
-default this is the git repository containing the current directory (or the
-current directory itself if it is not in a git repository). Pass `--repo` to
-work on a different project. Only `run` modifies it.
+`--repo` is optional. By default Donatello works on the git repository
+containing the current directory (or the current directory itself if it is not
+in a git repository). Pass `--repo` to work on a different project. Only `run`
+modifies it (`benchmark` accepts `--repo` but does not use the repository).
 
 To call `donatello` from any directory, link the installed command onto your
 `PATH`, e.g. `ln -s /path/to/Donatello/.venv/bin/donatello ~/.local/bin/donatello`.
 Keep the editable install (`pip install -e .`) in place: configs and the log
 file are located relative to this source folder.
 
-Create a plan without modifying the repository:
+Create a plan without modifying the repository (run from inside the project):
 
 ```sh
-donatello plan --repo /path/to/project "Add input validation to the user registration endpoint"
+donatello plan "Add input validation to the user registration endpoint"
 ```
 
-Run the plan against the project:
+Run the plan against the project, or against another one with `--repo`:
 
 ```sh
+donatello run "Add input validation to registration"
 donatello run --repo /path/to/project "Add input validation to registration"
 ```
 
 Use another local model or a different Ollama server:
 
 ```sh
-donatello run --repo /path/to/project --model qwen3:8b \
+donatello run --model qwen3:8b \
   --ollama-url http://localhost:11434 "Improve error handling"
 ```
 
@@ -69,7 +71,13 @@ At each prompt:
 - `--auto` approves and skips all further approval prompts.
 
 Pass `--auto` on the command line (`donatello run --auto "..."`) to skip
-approval entirely. `plan` never asks, since it changes nothing.
+approval entirely. `plan` never asks, since it changes nothing. If input ends
+(for example when piped) while a prompt is waiting, the run is cancelled; use
+`--auto` for unattended runs.
+
+The coding model is asked to give a `reason` for each file; if it omits one,
+the task summary or description is shown instead. Approval is per task, not
+per file.
 
 ## Configs
 
@@ -78,8 +86,8 @@ Models and system prompts live in JSON files in [configs/](configs). Without
 it by file name (the `.json` extension is optional):
 
 ```sh
-donatello plan --config fast --repo /path/to/project "Add input validation"
-donatello run --config fast --repo /path/to/project "Add input validation"
+donatello plan --config fast "Add input validation"
+donatello run --config fast "Add input validation"
 ```
 
 Each config defines `planner_model`, `coder_model`, `planner_system_prompt` and
@@ -88,6 +96,21 @@ Each config defines `planner_model`, `coder_model`, `planner_system_prompt` and
 Generated file paths are restricted to the selected repository. The coding
 agent can run Python `unittest` or `pytest` commands returned by the model;
 other test commands are rejected.
+
+## Logs
+
+`plan` and `run` append entries to `donatello.log` in the Donatello source
+folder (override with the `DONATELLO_LOG_FILE` environment variable). Each entry
+is indented, multi-line JSON tagged with a request ID:
+
+- `plan` entries record the original `request`, all command-line `arguments`
+  (including the repository actually used), the `plan` (or an `error`) and the
+  duration.
+- `task` entries record the task, duration, `files_written` as absolute paths,
+  and any `error`.
+
+Your home directory is written as `~` in the log. Log write failures are
+ignored so they never interrupt a run. `benchmark` does not log.
 
 ## External-agent fallback
 
@@ -112,7 +135,7 @@ Benchmark identical prompts on multiple models and review latency, token
 counts, whether the response contains valid JSON, and the response itself:
 
 ```sh
-donatello benchmark --repo /path/to/project --models qwen2.5-coder:7b qwen3:8b \
+donatello benchmark --models qwen2.5-coder:7b qwen3:8b \
   --prompt "Return a JSON object with an answer explaining Python decorators."
 ```
 

@@ -1,1 +1,1 @@
--e git+ssh://git@github.com/Dylan-Mead/Donatello.git@bdd9360d911ef0b5548cad635bb564a979ab55ef#egg=donatello
+-e git+ssh://git@github.com/Dylan-Mead/Donatello.git@53aab9b342e53c6fa9140a6fe5cc9865ef4db8ed#egg=donatello
