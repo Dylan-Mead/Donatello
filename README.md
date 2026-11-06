@@ -4,7 +4,9 @@ Donatello is a local-first Python coding assistant. It processes each coding
 request in two phases: a project manager turns the request into ordered JSON
 tasks, then a coding agent implements each task in a selected repository and
 runs supported tests. Before it changes anything, it shows you what it wants to
-do and waits for your approval (see [Approval](#approval)).
+do and waits for your approval (see [Approval](#approval)). Every proposed
+plan and task is also shown alongside the repository's architecture document
+for comparison (see [Architecture document](#architecture-document)).
 
 ## Requirements
 
@@ -48,6 +50,18 @@ donatello run "Add input validation to registration"
 donatello run --repo /path/to/project "Add input validation to registration"
 ```
 
+Instead of typing the request on the command line, read it from a text file
+with `--read`:
+
+```sh
+donatello plan --read path/to/request.txt
+donatello run --read path/to/request.txt
+```
+
+`--read` and the `request` argument are mutually exclusive; give exactly one.
+The file is read as UTF-8 and leading/trailing whitespace is stripped; an
+empty file is rejected.
+
 Use another local model or a different Ollama server:
 
 ```sh
@@ -78,6 +92,26 @@ approval entirely. `plan` never asks, since it changes nothing. If input ends
 The coding model is asked to give a `reason` for each file; if it omits one,
 the task summary or description is shown instead. Approval is per task, not
 per file.
+
+## Architecture document
+
+Donatello keeps a single system architecture and component design document per
+repository, `ARCHITECTURE.md` at the repository root (also recognized at
+`architecture.md`, `docs/ARCHITECTURE.md`, `docs/architecture.md`, or
+`.github/ARCHITECTURE.md` if one already exists there). It is deliberately
+compact -- a fixed set of short sections (Overview, Components, Data Flow,
+Interfaces, Dependencies, Decisions) -- so it stays useful context for small,
+local models instead of overwhelming them.
+
+For `run`, if the selected repository has no architecture document, Donatello
+always adds a task to create one, so its creation is proposed and approved
+like any other file change. If a document already exists, each task's prompt
+includes its current content and the model is asked to update only the
+sections that task affects. Every proposed plan and task shown for approval
+also displays the current architecture document (or notes that it does not
+exist yet), so you can compare the proposal against it before approving.
+`plan` shows the same comparison but, like the rest of `plan`, never writes
+the document.
 
 ## Configs
 

@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import architecture
+
 
 IGNORED_DIRECTORIES = {
     ".git",
@@ -31,7 +33,10 @@ DEFAULT_PLANNER_PROMPT = (
     "Break the user's request into a small, ordered set of actionable coding tasks. "
     'Return only JSON: {"tasks":[{"title":"...","description":"..."}]}. '
     "Do not include markdown or extra fields. "
-    "If the user requests changes, return a complete revised plan in the same JSON format."
+    "If the user requests changes, return a complete revised plan in the same JSON format. "
+    "Consider any provided system architecture and component design document; if the "
+    "request changes architecture, components, interfaces, or data flow, include a task "
+    "to update it."
 )
 DEFAULT_CODER_PROMPT = (
     "You are a coding agent. Implement the assigned task in the provided repository. "
@@ -41,7 +46,10 @@ DEFAULT_CODER_PROMPT = (
     '"tests":[["python","-m","unittest"]]}. '
     "Use repository-relative paths. Include only tests that should be run; "
     "tests must use Python unittest or pytest. Do not return shell commands. "
-    "If the user requests changes, return a complete revised response in the same JSON format."
+    "If the user requests changes, return a complete revised response in the same JSON format. "
+    "If the task asks you to create or update the system architecture and component design "
+    "document, or your changes affect architecture, components, interfaces, or data flow, "
+    "include that document in your files list with the appropriate content."
 )
 
 
@@ -54,16 +62,27 @@ class ProjectManager:
         self.provider = provider
         self.system_prompt = system_prompt
 
-    def plan(self, request: str, approver: Any = None) -> dict[str, Any]:
-        """Plan a request; with an approver, revise the plan until the user approves it."""
+    def plan(self, request: str, approver: Any = None, repo: Path | None = None) -> dict[str, Any]:
+        """Plan a request; with an approver, revise the plan until the user approves it.
+
+        When ``repo`` is given, the request is planned alongside the repository's
+        system architecture and component design document (donatello/architecture.py),
+        and the plan is guaranteed to include a task to create that document if it
+        does not exist yet.
+        """
+        user_content = request
+        if repo is not None:
+            user_content = f"{request}\n\n{architecture.context_block(repo)}"
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": request},
+            {"role": "user", "content": user_content},
         ]
         while True:
             response = self.provider.complete(messages, json_response=True)
             plan = self._parse_plan(response.text)
-            feedback = approver.review("Proposed plan", _format_plan(plan)) if approver else None
+            if repo is not None and architecture.find(repo) is None:
+                plan["tasks"].append(_architecture_document_task())
+            feedback = approver.review("Proposed plan", _format_plan(plan, repo)) if approver else None
             if feedback is None:
                 return plan
             messages += [
@@ -141,6 +160,7 @@ class CodingAgent:
                 "role": "user",
                 "content": (
                     f"Task: {task['title']}\n{task['description']}\n\n"
+                    f"{architecture.context_block(root)}\n\n"
                     f"Repository files:\n{context}"
                 ),
             },
@@ -254,11 +274,34 @@ def _parse_changes(text: str) -> dict[str, Any]:
     return changes
 
 
-def _format_plan(plan: dict[str, Any]) -> str:
-    return "\n".join(
+def _architecture_document_task() -> dict[str, str]:
+    """A task guaranteeing the architecture document is created when missing.
+
+    Donatello appends this to a plan whenever the target repository has no
+    system architecture and component design document yet, so its creation is
+    always proposed and reviewed like any other file change.
+    """
+    return {
+        "title": "Create system architecture and component design document",
+        "description": (
+            f"Create {architecture.FILENAME} at the repository root describing this "
+            "project's system architecture and component design, following the "
+            "provided template and reflecting the repository as a whole."
+        ),
+    }
+
+
+def _format_plan(plan: dict[str, Any], repo: Path | None = None) -> str:
+    lines = [
         f"{number}. {task['title']}\n   {task['description']}"
         for number, task in enumerate(plan["tasks"], 1)
-    )
+    ]
+    if repo is not None:
+        path, content = architecture.load(repo)
+        relative = path.relative_to(repo).as_posix()
+        status = "exists" if content is not None else "missing, will be created"
+        lines.append(f"\nArchitecture document ({relative}): {status}")
+    return "\n".join(lines)
 
 
 def _format_proposal(
@@ -272,6 +315,16 @@ def _format_proposal(
     if changes.get("summary"):
         lines.append(f"Summary: {changes['summary']}")
     lines.append(f"Repository: {root}")
+    arch_path, arch_content = architecture.load(root)
+    arch_relative = arch_path.relative_to(root).as_posix()
+    if arch_content is not None:
+        lines += [
+            "",
+            f"Architecture document for comparison ({arch_relative}):",
+            arch_content.rstrip("\n"),
+        ]
+    else:
+        lines += ["", f"No architecture document yet; expected at {arch_relative} once created."]
     for item, (_, target, content) in zip(changes["files"], targets):
         verb = "OVERWRITE existing file" if target.exists() else "CREATE new file"
         lines += [

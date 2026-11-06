@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from donatello import architecture
 from donatello.assistant import (
     AssistantError,
     CodingAgent,
@@ -17,8 +18,10 @@ from donatello.providers import ModelResponse
 class StubProvider:
     def __init__(self, responses):
         self.responses = iter(responses)
+        self.messages = []
 
     def complete(self, messages, json_response=False):
+        self.messages.append(list(messages))
         return ModelResponse(next(self.responses), "stub", 0.01)
 
 
@@ -34,8 +37,47 @@ class ProjectManagerTests(unittest.TestCase):
         with self.assertRaises(AssistantError):
             ProjectManager(StubProvider(['{"tasks":[]}'])).plan("Do work")
 
+    def test_appends_architecture_task_when_document_missing(self):
+        provider = StubProvider(['{"tasks":[{"title":"Add test","description":"Cover input"}]}'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = ProjectManager(provider).plan("Add validation", repo=root)
+            self.assertEqual(len(plan["tasks"]), 2)
+            self.assertIn(architecture.FILENAME, plan["tasks"][1]["description"])
+            self.assertIn(architecture.FILENAME, provider.messages[0][-1]["content"])
+
+    def test_does_not_append_architecture_task_when_document_exists(self):
+        provider = StubProvider(['{"tasks":[{"title":"Add test","description":"Cover input"}]}'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / architecture.FILENAME).write_text("# Architecture\n")
+            plan = ProjectManager(provider).plan("Add validation", repo=root)
+            self.assertEqual(len(plan["tasks"]), 1)
+
+    def test_plan_without_repo_has_no_architecture_context(self):
+        provider = StubProvider(['{"tasks":[{"title":"Add test","description":"Cover input"}]}'])
+        ProjectManager(provider).plan("Add validation")
+        self.assertNotIn(architecture.FILENAME, provider.messages[0][-1]["content"])
+
 
 class CodingAgentTests(unittest.TestCase):
+    def test_sends_architecture_context_and_writes_architecture_file(self):
+        response = json.dumps(
+            {
+                "summary": "Documented",
+                "files": [{"path": architecture.FILENAME, "content": "# Architecture\n\nNew.\n"}],
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider = StubProvider([response])
+            CodingAgent(provider).execute_plan(
+                {"tasks": [{"title": "Document", "description": "Create the architecture doc"}]},
+                root,
+            )
+            self.assertEqual((root / architecture.FILENAME).read_text(), "# Architecture\n\nNew.\n")
+            self.assertIn("No system architecture", provider.messages[0][-1]["content"])
+
     def test_applies_changes_and_runs_unittest(self):
         response = json.dumps(
             {

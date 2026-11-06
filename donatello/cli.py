@@ -26,6 +26,30 @@ def _default_repo() -> Path:
     return current
 
 
+def _resolve_request(args: argparse.Namespace) -> str:
+    """Return the coding request text from the positional argument or --read.
+
+    Exactly one of the positional "request" argument or "--read" must be
+    given; "--read" reads the request text from a file instead of requiring
+    it to be typed on the command line.
+    """
+    if args.request is not None and args.read is not None:
+        raise ValueError("Provide a request argument or --read, not both")
+    if args.read is not None:
+        path = args.read.expanduser()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValueError(f"Could not read request file: {error}") from error
+        request = text.strip()
+        if not request:
+            raise ValueError(f"Request file is empty: {path}")
+        return request
+    if args.request is None or not args.request.strip():
+        raise ValueError("A coding request is required, as an argument or via --read")
+    return args.request
+
+
 def _provider(model: str, args: argparse.Namespace) -> Any:
     primary = OllamaProvider(model=model, base_url=args.ollama_url)
     base_url = args.external_base_url or os.getenv("DONATELLO_EXTERNAL_BASE_URL")
@@ -50,7 +74,12 @@ def _parser() -> argparse.ArgumentParser:
 
     for name in ("plan", "run"):
         command = subparsers.add_parser(name, parents=[common])
-        command.add_argument("request", help="Coding request")
+        command.add_argument("request", nargs="?", help="Coding request (omit if --read is given)")
+        command.add_argument(
+            "--read",
+            type=Path,
+            help="Read the coding request from this file instead of passing it on the command line",
+        )
         command.add_argument("--config", help="Config file name in the configs folder (default: default)")
         command.add_argument("--model", help="Override the config's planner and coder models")
         command.add_argument("--ollama-url")
@@ -90,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.prompt,
             )
         else:
+            args.request = _resolve_request(args)
             config = load_config(args.config)
             planner_provider = _provider(args.model or config.planner_model, args)
             coder_provider = _provider(args.model or config.coder_model, args)
@@ -106,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             started = time.monotonic()
             try:
                 plan = ProjectManager(planner_provider, config.planner_system_prompt).plan(
-                    args.request, approver
+                    args.request, repo=args.repo, approver=approver
                 )
             except Exception as error:
                 request_log.plan(None, time.monotonic() - started, str(error), request_details)
